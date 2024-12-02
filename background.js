@@ -56,34 +56,15 @@ chrome.webNavigation.onCompleted.addListener(async (details) => {
 // Listen for content analysis results
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'contentAnalysis') {
-        // Show analyzing popup first
-        chrome.tabs.sendMessage(sender.tab.id, {
-            type: 'showPopup',
-            message: 'Analyzing page content...',
-            duration: 3000
-        });
-
         (async () => {
             try {
-                const aiAnalysis = await analyzeWithGemini(message.content);
-                const db = await initDB();
+                const aiAnalysis = await analyzeWithChromeAI(message.content);
                 
-                // Store analysis results
-                const transaction = db.transaction(['analyzedPages'], 'readwrite');
-                const store = transaction.objectStore('analyzedPages');
-                
-                store.add({
-                    url: sender.tab.url,
-                    timestamp: Date.now(),
-                    analysis: aiAnalysis,
-                    isRelevant: aiAnalysis.isRelevant,
-                    summary: aiAnalysis.summary
-                });
-
                 if (!aiAnalysis.isRelevant) {
                     await chrome.tabs.sendMessage(sender.tab.id, {
                         type: 'showWarning',
-                        message: `This page appears to be irrelevant.\nReason: ${aiAnalysis.reason}\nClosing tab in 5 seconds...`,
+                        reason: aiAnalysis.detailedSummary.fullReason,
+                        summary: aiAnalysis.detailedSummary.fullSummary,
                         duration: 5000
                     });
                     
@@ -95,7 +76,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 } else {
                     await chrome.tabs.sendMessage(sender.tab.id, {
                         type: 'showPopup',
-                        message: 'Page is relevant to your studies!',
+                        message: `Page is relevant to your studies!\n${aiAnalysis.summary}`,
                         duration: 2000
                     });
                 }
@@ -113,62 +94,80 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 });
 
-async function analyzeWithGemini(content) {
-    const API_KEY = 'AIzaSyDuBZP3yPHNgql5ge8vbOXOEaMcyA8goQY'; // Replace with your API key
-    const API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent';
-
+async function analyzeWithChromeAI(content) {
     try {
-        const response = await fetch(`${API_URL}?key=${API_KEY}`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                contents: [{
-                    parts: [{
-                        text: `Analyze this webpage content and determine if it's relevant to the study topic "${content.studyTopic}".
-                               Return the response in the following JSON format:
-                               {
-                                   "relevanceScore": (number between 0 and 1),
-                                   "summary": "brief summary of the content",
-                                   "explanation": "explanation of relevance score"
-                               }
-                               
-                               Webpage content: ${content.text}`
-                    }]
-                }],
-                generationConfig: {
-                    temperature: 0.7,
-                    topK: 40,
-                    topP: 0.95,
-                }
-            })
-        });
-
-        const result = await response.json();
-        let analysisResult;
+        console.log('Checking AI capabilities...');
+        const capabilities = await ai.languageModel.capabilities();
         
-        try {
-            // Parse the JSON from the response text
-            analysisResult = JSON.parse(result.candidates[0].content.parts[0].text);
-        } catch (parseError) {
-            console.error('Failed to parse Gemini response:', parseError);
-            throw new Error('Invalid response format');
+        if (capabilities.available === "no") {
+            throw new Error("Chrome AI model not available");
         }
 
-        return {
-            isRelevant: analysisResult.relevanceScore >= 0.6,
-            summary: analysisResult.summary,
-            reason: analysisResult.explanation,
-            confidence: analysisResult.relevanceScore
-        };
+        const session = await ai.languageModel.create();
+        
+        // More structured prompt for clearer responses
+        const prompt = `Analyze this webpage content and determine if it's relevant to the study topic "${content.studyTopic}".
+        
+        Provide your analysis in this exact JSON format:
+        {
+            "relevanceScore": (a number between 0 and 1),
+            "summary": "Write a clear 2-3 sentence summary of the content here",
+            "explanation": "Provide a detailed explanation of why this content is or isn't relevant to the study topic"
+        }
+
+        Content to analyze: ${content.text.substring(0, 1000)}`;
+
+        console.log('Sending prompt to AI...');
+        const result = await session.prompt(prompt);
+
+        let analysisResult;
+        try {
+            const cleanResult = result.trim().replace(/```json|```/g, '');
+            analysisResult = JSON.parse(cleanResult);
+            
+            // Store analysis details
+            const analysis = {
+                isRelevant: analysisResult.relevanceScore >= 0.6,
+                summary: analysisResult.summary,
+                reason: analysisResult.explanation,
+                confidence: analysisResult.relevanceScore,
+                detailedSummary: {
+                    topic: content.studyTopic,
+                    pageTitle: content.title,
+                    analysisTime: new Date().toISOString(),
+                    fullReason: analysisResult.explanation,
+                    fullSummary: analysisResult.summary
+                }
+            };
+
+            // Log for debugging
+            console.log('Analysis result:', analysis);
+
+            return analysis;
+
+        } catch (parseError) {
+            console.error('Failed to parse AI response:', parseError);
+            throw parseError;
+        }
     } catch (error) {
-        console.error('Gemini Analysis failed:', error);
+        console.error('Chrome AI Analysis failed:', {
+            name: error.name,
+            message: error.message,
+            stack: error.stack
+        });
+        
         return {
-            isRelevant: true, // Fail open to avoid blocking legitimate content
-            summary: "Analysis failed",
-            reason: "Could not perform AI analysis",
-            confidence: 0
+            isRelevant: true, // Fail open
+            summary: "Content analysis unavailable",
+            reason: `Unable to analyze content: ${error.message}`,
+            confidence: 0,
+            detailedSummary: {
+                topic: content.studyTopic,
+                pageTitle: content.title,
+                analysisTime: new Date().toISOString(),
+                fullReason: "Analysis failed",
+                fullSummary: "Analysis could not be performed"
+            }
         };
     }
 }
